@@ -4,12 +4,16 @@
 #include <iostream>
 #include <map>
 #include <set>
+#include <cassert>
+#include <deque>
 
 #ifdef USE_MPI
 #include <mpi.h>
 
 typedef std::vector<std::vector<edge_id_t > > result_t;
 result_t really_result;
+
+typedef vertex_id_t component_id_t;
 
 typedef struct {
     double weight;
@@ -29,14 +33,6 @@ void for_custom_operation(void* inputBuffer, void* outputBuffer, int* len, MPI_D
             output[i].index = input[i].index;
         }
     }
-}
-
-vertex_id_t fix_idx(std::vector<vertex_id_t> &placeholder, vertex_id_t i) {
-    while(placeholder[i] != i) { 
-        i = placeholder[i];
-    }
-    
-    return i;
 }
 
 //Copy from example mst_reference_mpi.cpp
@@ -94,11 +90,12 @@ extern "C" void* MST(graph_t *G) {
     vertex_id_t local_n = G->local_n;
 
     std::set<edge_id_t> result{};
-    std::vector<vertex_id_t> placeholder(G->n);
     bool changed = true;
 
     std::vector<weight_edge_id_t> element_w_e_i(G->n);
-    std::map<vertex_id_t, vertex_id_t> components;
+    std::map<vertex_id_t, component_id_t> components;
+
+    std::map<component_id_t, weight_edge_id_t> comp_transform; //###################################################
    
     for (vertex_id_t i = 0; i < local_n; i++) {
         vertex_id_t i_global = VERTEX_TO_GLOBAL(i, G->n, size, rank);
@@ -111,17 +108,12 @@ extern "C" void* MST(graph_t *G) {
             if (VERTEX_OWNER(v_global, G->n, size) != rank) {
                 components[v_global] = v_global;
             }
-            //printf("(%d) --- %d -%lf-> %d\n", edge_to_global(e, G), u_local, G->weights[e], v_global);
         }
     }
 
     while(changed) {
         changed = false;
-        for (int i = 0; i < G->n; i++) {
-            element_w_e_i[i].weight = std::numeric_limits<double>::max();
-            element_w_e_i[i].index = -1;
-            placeholder[i] = i;
-        }
+        comp_transform.clear(); //######################################################
 
         for (vertex_id_t u_local = 0; u_local < local_n; u_local++) {
             vertex_id_t u_global = VERTEX_TO_GLOBAL(u_local, G->n, size, rank);
@@ -129,41 +121,84 @@ extern "C" void* MST(graph_t *G) {
             for (edge_id_t e = G->rowsIndices[u_local]; e < G->rowsIndices[u_local + 1]; e++) {
                 vertex_id_t v_global = G->endV[e];
                 vertex_id_t v_component = components[v_global];
-                if (u_component != v_component && (G->weights[e] < element_w_e_i[u_component].weight ||
-                    G->weights[e] == element_w_e_i[u_component].weight && v_component < element_w_e_i[u_component].index)) {
-                    element_w_e_i[u_component].weight = G->weights[e];
-                    element_w_e_i[u_component].edge = edge_to_global(e, G);
-                    element_w_e_i[u_component].index = v_component;
+                if (u_component != v_component && (comp_transform.find(u_component) == comp_transform.end() || G->weights[e] < comp_transform[u_component].weight ||
+                    G->weights[e] == comp_transform[u_component].weight && v_component < comp_transform[u_component].index)) {
+                    comp_transform[u_component] = {G->weights[e], edge_to_global(e, G), v_component}; //####################################################
                 }
             }
         }
+
+        //#############################<BEGIN>##########################################
+        for (int i = 0; i < G->n; i++) {
+            element_w_e_i[i].weight = std::numeric_limits<double>::max();
+            element_w_e_i[i].index = -1;
+        }
+
+        for (auto it = comp_transform.begin(); it != comp_transform.end(); ++it) {
+            element_w_e_i[it->first] = it->second;
+        }
+
+        int fragment_size = G->n / size + 1;
+
 
         MPI_Allreduce(MPI_IN_PLACE, element_w_e_i.data(), G->n, mpi_struct_w_e_i, operation, MPI_COMM_WORLD);
 
-        for(vertex_id_t i = 0; i < G->n; i++) {
-            if (element_w_e_i[i].index != -1) {
-                vertex_id_t id1 = fix_idx(placeholder, i);
-                vertex_id_t id2 = fix_idx(placeholder, element_w_e_i[i].index);
-                if (id1 == id2) {
-                    continue;
-                }
-                vertex_id_t min_id = (id1 < id2) ? id1 : id2;
-                placeholder[id1] = min_id;
-                placeholder[id2] = min_id;
+        std::map<component_id_t, component_id_t> fragment_transform;
 
-                for (auto it = components.begin(); it != components.end(); ++it) {
-                    if (components[it->first] == id1 || components[it->first] == id2) {
-                        components[it->first] = min_id;
+        for(component_id_t i = 0; i < G->n; i++) {
+            fragment_transform[i] = element_w_e_i[i].index;
+        }
+
+        for(component_id_t i = 0; i < G->n; i++) {
+            if (fragment_transform[i] != -1) {
+                if (fragment_transform[fragment_transform[i]] != i || fragment_transform[i] > i) {
+                    if (rank == 0) {
+                        result.insert(element_w_e_i[i].edge);
                     }
-                }
-
-                if (rank == 0) {
-                    result.insert(element_w_e_i[i].edge);
-                }
-                changed = true;
+                    
+                    changed = true;
+                } 
             }
         }
 
+        std::map<component_id_t, std::set<component_id_t>> traversing_graph;
+
+        for(component_id_t i = 0; i < G->n; i++) {
+            if (fragment_transform[i] != -1) {
+                traversing_graph[i].insert(fragment_transform[i]);
+                traversing_graph[fragment_transform[i]].insert(i);
+                fragment_transform[i] = i;
+            }
+        }
+
+        for (component_id_t i = 0; i < G->n; i++) {
+            if (fragment_transform[i] == i) {
+                std::deque<component_id_t> queue;
+                queue.push_back(i);
+                while(!queue.empty()) {
+                    component_id_t cur = queue.front();
+                    queue.pop_front();
+                    for(component_id_t tmp : traversing_graph[cur]) {
+                        if(fragment_transform[tmp] != i) {
+                            fragment_transform[tmp] = i;
+                            queue.push_back(tmp);
+                        }
+                    }
+                }
+            }
+        }
+
+        for (auto it = comp_transform.begin(); it != comp_transform.end(); ++it) {
+            if (fragment_transform.find(it->first) != fragment_transform.end()) {
+                comp_transform[it->first].index = fragment_transform[it->first];
+            }
+        }
+
+        for (auto it = components.begin(); it != components.end(); ++it) {
+            if (fragment_transform.find(components[it->first]) != fragment_transform.end()) {
+                components[it->first] = fragment_transform[components[it->first]];
+            }
+        }
     }
 
     MPI_Op_free(&operation);
