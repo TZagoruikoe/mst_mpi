@@ -92,11 +92,10 @@ extern "C" void* MST(graph_t *G) {
     std::set<edge_id_t> result{};
     bool changed = true;
 
-    std::vector<weight_edge_id_t> element_w_e_i(G->n);
     std::map<vertex_id_t, component_id_t> components;
+    std::map<component_id_t, weight_edge_id_t> comp_transform;
+    std::map<component_id_t, component_id_t> shadow_comp_transform;
 
-    std::map<component_id_t, weight_edge_id_t> comp_transform; //###################################################
-   
     for (vertex_id_t i = 0; i < local_n; i++) {
         vertex_id_t i_global = VERTEX_TO_GLOBAL(i, G->n, size, rank);
         components[i_global] = i_global;
@@ -113,7 +112,8 @@ extern "C" void* MST(graph_t *G) {
 
     while(changed) {
         changed = false;
-        comp_transform.clear(); //######################################################
+        comp_transform.clear();
+        shadow_comp_transform.clear();
 
         for (vertex_id_t u_local = 0; u_local < local_n; u_local++) {
             vertex_id_t u_global = VERTEX_TO_GLOBAL(u_local, G->n, size, rank);
@@ -123,80 +123,121 @@ extern "C" void* MST(graph_t *G) {
                 vertex_id_t v_component = components[v_global];
                 if (u_component != v_component && (comp_transform.find(u_component) == comp_transform.end() || G->weights[e] < comp_transform[u_component].weight ||
                     G->weights[e] == comp_transform[u_component].weight && v_component < comp_transform[u_component].index)) {
-                    comp_transform[u_component] = {G->weights[e], edge_to_global(e, G), v_component}; //####################################################
+                    comp_transform[u_component] = {G->weights[e], edge_to_global(e, G), v_component};
                 }
-            }
-        }
-
-        //#############################<BEGIN>##########################################
-        for (int i = 0; i < G->n; i++) {
-            element_w_e_i[i].weight = std::numeric_limits<double>::max();
-            element_w_e_i[i].index = -1;
-        }
-
-        for (auto it = comp_transform.begin(); it != comp_transform.end(); ++it) {
-            element_w_e_i[it->first] = it->second;
-        }
-
-        int fragment_size = G->n / size + 1;
-
-
-        MPI_Allreduce(MPI_IN_PLACE, element_w_e_i.data(), G->n, mpi_struct_w_e_i, operation, MPI_COMM_WORLD);
-
-        std::map<component_id_t, component_id_t> fragment_transform;
-
-        for(component_id_t i = 0; i < G->n; i++) {
-            fragment_transform[i] = element_w_e_i[i].index;
-        }
-
-        for(component_id_t i = 0; i < G->n; i++) {
-            if (fragment_transform[i] != -1) {
-                if (fragment_transform[fragment_transform[i]] != i || fragment_transform[i] > i) {
-                    if (rank == 0) {
-                        result.insert(element_w_e_i[i].edge);
-                    }
-                    
-                    changed = true;
-                } 
-            }
-        }
-
-        std::map<component_id_t, std::set<component_id_t>> traversing_graph;
-
-        for(component_id_t i = 0; i < G->n; i++) {
-            if (fragment_transform[i] != -1) {
-                traversing_graph[i].insert(fragment_transform[i]);
-                traversing_graph[fragment_transform[i]].insert(i);
-                fragment_transform[i] = i;
-            }
-        }
-
-        for (component_id_t i = 0; i < G->n; i++) {
-            if (fragment_transform[i] == i) {
-                std::deque<component_id_t> queue;
-                queue.push_back(i);
-                while(!queue.empty()) {
-                    component_id_t cur = queue.front();
-                    queue.pop_front();
-                    for(component_id_t tmp : traversing_graph[cur]) {
-                        if(fragment_transform[tmp] != i) {
-                            fragment_transform[tmp] = i;
-                            queue.push_back(tmp);
-                        }
-                    }
-                }
-            }
-        }
-
-        for (auto it = comp_transform.begin(); it != comp_transform.end(); ++it) {
-            if (fragment_transform.find(it->first) != fragment_transform.end()) {
-                comp_transform[it->first].index = fragment_transform[it->first];
             }
         }
 
         for (auto it = components.begin(); it != components.end(); ++it) {
-            if (fragment_transform.find(components[it->first]) != fragment_transform.end()) {
-                components[it->first] = fragment_transform[components[it->first]];
+            if (comp_transform.find(components[it->first]) != comp_transform.end()) {
+                shadow_comp_transform[components[it->first]] = comp_transform[components[it->first]].index;
+            }
+            else {
+                shadow_comp_transform[components[it->first]] = -1;
+            }
+        }
+
+        int fragment_size = G->n / size;
+
+        for (int frag_id = G->n / fragment_size - (G->n % fragment_size == 0); frag_id >= 0; frag_id--) {
+            std::vector<weight_edge_id_t> element_w_e_i(fragment_size);
+            for (int i = 0; i < fragment_size; i++) {
+                element_w_e_i[i].weight = std::numeric_limits<double>::max();
+                element_w_e_i[i].index = -1;
+            }
+
+            for (auto it = comp_transform.begin(); it != comp_transform.end(); ++it) {
+                if (frag_id * fragment_size <= it->first && it->first < (frag_id + 1) * fragment_size) {
+                    element_w_e_i[it->first - frag_id * fragment_size] = it->second;
+                } 
+            }
+
+            MPI_Allreduce(MPI_IN_PLACE, element_w_e_i.data(), fragment_size, mpi_struct_w_e_i, operation, MPI_COMM_WORLD);
+
+            std::map<component_id_t, component_id_t> fragment_transform;
+            std::set<component_id_t> missing_index;
+            std::vector<int> missing_index_value;
+
+            for(component_id_t i = 0; i < fragment_size; i++) {
+                if (element_w_e_i[i].index >= (frag_id + 1) * fragment_size) {
+                    missing_index.insert(element_w_e_i[i].index);
+                }
+                fragment_transform[frag_id * fragment_size + i] = element_w_e_i[i].index;
+            }
+
+            for(component_id_t i : missing_index) {
+                if (shadow_comp_transform.find(i) != shadow_comp_transform.end()) {
+                    missing_index_value.push_back(shadow_comp_transform[i]);
+                }
+                else {
+                    missing_index_value.push_back(-1);
+                }
+            }
+
+            MPI_Allreduce(MPI_IN_PLACE, missing_index_value.data(), missing_index_value.size(), MPI_INT, MPI_MAX, MPI_COMM_WORLD);
+
+            int k = 0;
+
+            for(component_id_t i : missing_index) {
+                fragment_transform[i] = missing_index_value[k];
+                k++;
+            }
+
+            for(component_id_t i = frag_id * fragment_size; i < (frag_id + 1) * fragment_size; i++) {
+                if (fragment_transform[i] != -1) {
+                    if (fragment_transform[i] < i || fragment_transform[fragment_transform[i]] != i) {
+                        if (rank == 0) {
+                            result.insert(element_w_e_i[i - frag_id * fragment_size].edge);
+                        }
+                        
+                        changed = true;
+                    } 
+                }
+            }
+
+            std::map<component_id_t, std::set<component_id_t>> traversing_graph;
+
+            for(auto it = fragment_transform.begin(); it != fragment_transform.end(); ++it) {
+                if (fragment_transform[it->first] != -1) {
+                    traversing_graph[it->first].insert(fragment_transform[it->first]);
+                    traversing_graph[fragment_transform[it->first]].insert(it->first);
+                }
+            }
+
+            for(auto it = traversing_graph.begin(); it != traversing_graph.end(); ++it) {
+                fragment_transform[it->first] = it->first;
+            }
+
+            for (auto it = traversing_graph.begin(); it != traversing_graph.end(); ++it) {
+                if (fragment_transform[it->first] == it->first) {
+                    std::deque<component_id_t> queue;
+                    queue.push_back(it->first);
+                    while(!queue.empty()) {
+                        component_id_t cur = queue.front();
+                        queue.pop_front();
+                        for(component_id_t tmp : traversing_graph[cur]) {
+                            if(fragment_transform[tmp] != it->first) {
+                                fragment_transform[tmp] = it->first;
+                                queue.push_back(tmp);
+                            }
+                        }
+                    }
+                }
+            }
+
+            for (auto it = shadow_comp_transform.begin(); it != shadow_comp_transform.end(); ++it) {
+                if (fragment_transform.find(it->first) != fragment_transform.end()) {
+                    shadow_comp_transform[it->first] = fragment_transform[it->first];
+                }
+                else if (it->first >= (frag_id + 1) * fragment_size && fragment_transform.find(it->second) != fragment_transform.end()) {
+                    shadow_comp_transform[it->first] = fragment_transform[it->second];
+                }
+            }
+        }  
+
+        for (auto it = components.begin(); it != components.end(); ++it) {
+            if (shadow_comp_transform.find(components[it->first]) != shadow_comp_transform.end()) {
+                components[it->first] = shadow_comp_transform[components[it->first]];
             }
         }
     }
@@ -205,9 +246,6 @@ extern "C" void* MST(graph_t *G) {
     MPI_Type_free(&mpi_struct_w_e_i);
 
     std::vector<edge_id_t> tmp(result.begin(), result.end());
-    //for (int i = 0; i < tmp.size(); i++) {
-    //    printf("%d\n", tmp[i]);
-    //}
     really_result.clear();
     really_result.push_back(tmp);
 
