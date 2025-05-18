@@ -9,6 +9,7 @@
 
 #ifdef USE_MPI
 #include <mpi.h>
+#include <omp.h>
 
 typedef std::vector<std::vector<edge_id_t > > result_t;
 result_t really_result;
@@ -138,19 +139,30 @@ extern "C" void* MST(graph_t *G) {
         }
 
         int fragment_size = G->n / size;
+        std::vector<component_id_t> comp_transform_keys;
+
+        for (auto it = comp_transform.begin(); it != comp_transform.end(); ++it) {
+            comp_transform_keys.push_back(it->first);
+        }
 
         for (int frag_id = G->n / fragment_size - (G->n % fragment_size == 0); frag_id >= 0; frag_id--) {
             std::vector<weight_edge_id_t> element_w_e_i(fragment_size);
+
+#pragma omp parallel 
+{
+    #pragma omp for
             for (int i = 0; i < fragment_size; i++) {
                 element_w_e_i[i].weight = std::numeric_limits<double>::max();
                 element_w_e_i[i].index = -1;
             }
 
-            for (auto it = comp_transform.begin(); it != comp_transform.end(); ++it) {
-                if (frag_id * fragment_size <= it->first && it->first < (frag_id + 1) * fragment_size) {
-                    element_w_e_i[it->first - frag_id * fragment_size] = it->second;
+    #pragma omp for
+            for (auto it = comp_transform_keys.begin(); it != comp_transform_keys.end(); ++it) {
+                if (frag_id * fragment_size <= *it && *it < (frag_id + 1) * fragment_size) {
+                    element_w_e_i[*it - frag_id * fragment_size] = comp_transform[*it];
                 } 
             }
+}
 
             MPI_Allreduce(MPI_IN_PLACE, element_w_e_i.data(), fragment_size, mpi_struct_w_e_i, operation, MPI_COMM_WORLD);
 
@@ -195,7 +207,7 @@ extern "C" void* MST(graph_t *G) {
                 }
             }
 
-            std::map<component_id_t, std::set<component_id_t>> traversing_graph;
+            std::map<component_id_t, std::set<component_id_t> > traversing_graph;
 
             for(auto it = fragment_transform.begin(); it != fragment_transform.end(); ++it) {
                 if (fragment_transform[it->first] != -1) {
@@ -210,17 +222,32 @@ extern "C" void* MST(graph_t *G) {
 
             for (auto it = traversing_graph.begin(); it != traversing_graph.end(); ++it) {
                 if (fragment_transform[it->first] == it->first) {
-                    std::deque<component_id_t> queue;
+                    std::vector<component_id_t> queue;
+                    std::vector<component_id_t> clone_queue;
                     queue.push_back(it->first);
                     while(!queue.empty()) {
-                        component_id_t cur = queue.front();
-                        queue.pop_front();
-                        for(component_id_t tmp : traversing_graph[cur]) {
-                            if(fragment_transform[tmp] != it->first) {
-                                fragment_transform[tmp] = it->first;
-                                queue.push_back(tmp);
+                        int queue_size = queue.size();
+#pragma omp parallel
+{
+                        std::vector<component_id_t> local_queue;
+    #pragma omp for nowait
+                        for (int j = 0; j < queue_size; j++) {
+                            component_id_t cur;
+                            cur = queue[j];
+                            for(component_id_t tmp : traversing_graph[cur]) {
+                                if(fragment_transform[tmp] != it->first) {
+                                    fragment_transform[tmp] = it->first;
+                                    local_queue.push_back(tmp);
+                                }
                             }
                         }
+    #pragma omp critical
+    {
+                        clone_queue.insert(clone_queue.end(), local_queue.begin(), local_queue.end());
+    }
+}
+                        queue.clear();
+                        std::swap(queue, clone_queue);
                     }
                 }
             }
